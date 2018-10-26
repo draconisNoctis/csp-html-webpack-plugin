@@ -17,6 +17,26 @@ const defaultAdditionalOpts = {
   hashingMethod: 'sha256'
 };
 
+
+const path = {
+    dirname(p) {
+        const parts = p.replace(/\/$/, '').split(/\//).filter(Boolean);
+        return parts.slice(0, parts.length - 1).join('/')
+    },
+    resolve(from, p) {
+        const fp = from.replace(/\/$/, '').split(/\//).filter(Boolean);
+        const pp = p.split(/\//);
+        for(const n of pp) {
+            if('..' === n) {
+                fp.pop();
+            } else {
+                fp.push(n)
+            }
+        }
+        return fp.join('/')
+    }
+};
+
 class CspHtmlWebpackPlugin {
   /**
    * Setup for our plugin
@@ -43,9 +63,9 @@ class CspHtmlWebpackPlugin {
    * @param htmlPluginData - the htmlPluginData from compilation
    * @return {boolean} - whether the plugin is enabled or not
    */
-  isEnabled(htmlPluginData) {
+  isEnabled(plugin) {
     if (isFunction(this.opts.enabled)) {
-      return this.opts.enabled(htmlPluginData);
+      return this.opts.enabled(plugin);
     }
 
     return this.opts.enabled;
@@ -88,54 +108,68 @@ class CspHtmlWebpackPlugin {
    * @param htmlPluginData
    * @param compileCb
    */
-  processCsp(htmlPluginData, compileCb) {
-    const $ = cheerio.load(htmlPluginData.html, {
+  processCsp(compilation, plugin, html) {
+    const $ = cheerio.load(html, {
       decodeEntities: false
     });
 
     let metaTag = $('meta[http-equiv="Content-Security-Policy"]');
 
     // if not enabled, remove the empty tag
-    if (!this.isEnabled(htmlPluginData)) {
+    if (!this.isEnabled(plugin)) {
       metaTag.remove();
+    } else {
+      // Add element if it doesn't exist.
+      if (!metaTag.length) {
+        metaTag = cheerio.load('<meta http-equiv="Content-Security-Policy">')(
+          'meta'
+        );
+        metaTag.appendTo($('head'));
+      }
 
-      // eslint-disable-next-line no-param-reassign
-      htmlPluginData.html = $.html();
+      const policyObj = JSON.parse(JSON.stringify(this.policy));
 
-      return compileCb(null, htmlPluginData);
-    }
+      const inlineSrc = $('script:not([src])')
+        .map((i, element) => this.hash($(element).html()))
+        .get();
+      const inlineStyle = $('style:not([href])')
+        .map((i, element) => this.hash($(element).html()))
+        .get();
+      // console.log(compilation);
+      const relSrc = $('script[src]')
+        .map((i, element) => $(element))
+        .get()
+        .filter(element => !element.attr('src').match(/^\/|https?/))
+        .map(element => {
+          const file = path.resolve(path.dirname(plugin.options.filename), element.attr('src'));
+          const hash = this.hash(compilation.assets[file].source());
 
-    // Add element if it doesn't exist.
-    if (!metaTag.length) {
-      metaTag = cheerio.load('<meta http-equiv="Content-Security-Policy">')(
-        'meta'
+          element.attr('integrity', hash.substr(1, hash.length - 2));
+
+          return hash;
+        });
+
+      // Wrapped in flatten([]) to handle both when policy is a string and an array
+      policyObj['script-src'] = flatten([policyObj['script-src']]).concat(
+        inlineSrc,
+        relSrc
       );
-      metaTag.appendTo($('head'));
+      policyObj['style-src'] = flatten([policyObj['style-src']]).concat(
+        inlineStyle
+      );
+
+      metaTag.attr('content', this.buildPolicy(policyObj));
     }
 
-    const policyObj = JSON.parse(JSON.stringify(this.policy));
-
-    const inlineSrc = $('script:not([src])')
-      .map((i, element) => this.hash($(element).html()))
-      .get();
-    const inlineStyle = $('style:not([href])')
-      .map((i, element) => this.hash($(element).html()))
-      .get();
-
-    // Wrapped in flatten([]) to handle both when policy is a string and an array
-    policyObj['script-src'] = flatten([policyObj['script-src']]).concat(
-      inlineSrc
-    );
-    policyObj['style-src'] = flatten([policyObj['style-src']]).concat(
-      inlineStyle
-    );
-
-    metaTag.attr('content', this.buildPolicy(policyObj));
-
-    // eslint-disable-next-line no-param-reassign
-    htmlPluginData.html = $.html();
-
-    return compileCb(null, htmlPluginData);
+    const newHtml = $.html();
+    return {
+      source() {
+        return newHtml;
+      },
+      size() {
+        return newHtml.length;
+      }
+    };
   }
 
   /**
@@ -143,22 +177,15 @@ class CspHtmlWebpackPlugin {
    * @param compiler
    */
   apply(compiler) {
-    if (compiler.hooks) {
-      compiler.hooks.compilation.tap('CspHtmlWebpackPlugin', compilation => {
-        compilation.hooks.htmlWebpackPluginAfterHtmlProcessing.tapAsync(
-          'CspHtmlWebpackPlugin',
-          this.processCsp.bind(this)
-        );
-      });
-    } else {
-      compiler.plugin('compilation', compilation => {
-        compilation.plugin(
-          'html-webpack-plugin-after-html-processing',
-          this.processCsp.bind(this)
-        );
-      });
-    }
+    compiler.plugin('emit', (compilation, done) => {
+      const plugins = compilation.compiler.options.plugins.filter(plugin => plugin.constructor.name === 'HtmlWebpackPlugin');
+      for(const plugin of plugins) {
+        compilation.assets[plugin.options.filename] = this.processCsp(compilation, plugin, compilation.assets[plugin.options.filename].source())
+      }
+      done();
+    });
   }
 }
+
 
 module.exports = CspHtmlWebpackPlugin;
